@@ -121,7 +121,7 @@ def chat_response(message, history):
 # -------------------------
 demo = gr.ChatInterface(
     fn=chat_response,
-    title="📊 FinRAG: Financial Intelligence Assistant",
+    title="FinRAG: Financial Intelligence Assistant",
     description=(
         "Ask questions about recent financial news. "
         "The system retrieves relevant news using vector search and generates source-grounded answers."
