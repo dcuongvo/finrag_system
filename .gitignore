@@ -1,0 +1,76 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env/
+.env
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Jupyter / notebooks
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Build / packaging
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Data files
+# =========================
+data/raw/
+data/processed/
+
+# =========================
+# Qdrant local storage
+# =========================
+qdrant_data/
+
+# =========================
+# HuggingFace cache (optional)
+# =========================
+.cache/
+.huggingface/
+
+# =========================
+# PyTorch / model artifacts
+# =========================
+*.pt
+*.bin
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
