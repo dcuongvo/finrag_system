@@ -2,84 +2,51 @@
 File: app.py
 
 Purpose:
-Gradio Blocks UI for FinRAG – Chat, Stocks dashboard, and News Feed tabs.
+Gradio Blocks UI for FinRAG – Chat, Stocks dashboard, News Feed, and Index tabs.
 
 Role in Pipeline:
-Application Layer – Initializes the RAG components once, then lets users
-interact via chat, browse stock prices, and explore the news index.
+Application Layer – Initializes RAG components; ingestion is triggered
+from the Index tab (or on startup if INGEST_ON_STARTUP=true).
 """
 
 import pandas as pd
 import gradio as gr
 from datetime import datetime
 
-from src.ingestion.ingest_news import load_company_news, load_market_news, load_stock_data
-from src.ingestion.finnhub_loader import FinnhubLoader, fetch_candles_yf
-from src.embeddings.bge_embedder import BGEEmbedder
-from src.vector_store.qdrant_store import QdrantVectorStore
-from src.retrieval.retriever import Retriever
-from src.generation.factory import get_llm_provider
+from config.settings import (
+    AWS_POSTGRES_URL,
+    DAYS_BACK,
+    DEFAULT_TICKERS,
+    INGEST_ON_STARTUP,
+    POSTGRES_URL,
+    TOP_K,
+    VECTOR_BACKEND,
+)
+from src.embeddings.factory import get_embedder
 from src.generation.answer_generator import AnswerGenerator
+from src.generation.factory import get_llm_provider
+from src.ingestion.pipeline import run_ingestion, sync_to_aws
+from src.retrieval.retriever import Retriever
+from src.vector_store.factory import get_vector_store
 
 
 # ── Initialization ────────────────────────────────────────────────────────────
 print("Initializing FinRAG system...")
 
-TICKERS = ["NVDA", "AAPL", "TSLA", "MSFT"]
+TICKERS = DEFAULT_TICKERS
 
-embedder = BGEEmbedder()
-vector_store = QdrantVectorStore(vector_size=768)
-
-print("Fetching company news...")
-company_docs = load_company_news(TICKERS, days_back=7)
-
-print("Fetching market news...")
-market_docs = load_market_news(["general"])
-
-print("Fetching stock price data...")
-stock_docs = load_stock_data(TICKERS, days_back=7)
-
-# Fetch raw candle data for the price chart (30 days).
-# Try Finnhub first; fall back to Yahoo Finance (free, no key needed).
-_loader = FinnhubLoader()
-raw_candles: dict[str, dict] = {}
-for _ticker in TICKERS:
-    _candles = _loader.fetch_stock_candles(_ticker, days_back=30)
-    if not (_candles.get("s") == "ok" and _candles.get("t")):
-        print(f"Finnhub candles unavailable for {_ticker}, trying Yahoo Finance...")
-        _candles = fetch_candles_yf(_ticker, days_back=30)
-    if _candles.get("s") == "ok" and _candles.get("t"):
-        raw_candles[_ticker] = _candles
-
-all_docs = company_docs + market_docs + stock_docs
-print(
-    f"Fetched {len(all_docs)} total documents "
-    f"({len(company_docs)} company news, {len(market_docs)} market news, "
-    f"{len(stock_docs)} stock price summaries)."
-)
-
-existing_urls = vector_store.get_existing_urls()
-new_docs = [d for d in all_docs if d["metadata"].get("url") not in existing_urls]
-print(
-    f"{len(new_docs)} new documents to embed and store "
-    f"({len(all_docs) - len(new_docs)} already indexed)."
-)
-
-if new_docs:
-    texts = [doc["text"] for doc in new_docs]
-    embeddings = embedder.embed_documents(texts)
-    for i, doc in enumerate(new_docs):
-        doc["embedding"] = embeddings[i].tolist()
-    vector_store.upsert(new_docs)
-    print(f"Stored {len(new_docs)} new documents.")
-else:
-    print("No new documents — index is up to date.")
-
+embedder = get_embedder()
+vector_store = get_vector_store()
 retriever = Retriever(embedder, vector_store)
 llm = get_llm_provider()
 generator = AnswerGenerator(llm)
 
-print("FinRAG system ready.")
+print(f"Vector backend: {VECTOR_BACKEND}")
+
+company_docs: list = []
+market_docs: list = []
+stock_docs: list = []
+raw_candles: dict = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -107,8 +74,6 @@ def find_last_ticker(history: list) -> str | None:
     return None
 
 
-# ── Static data for Stocks / News tabs ───────────────────────────────────────
-
 def _build_price_df() -> pd.DataFrame:
     rows = []
     for ticker, candles in raw_candles.items():
@@ -125,17 +90,17 @@ def _build_price_df() -> pd.DataFrame:
 
 def _build_stock_summary_md() -> str:
     if not raw_candles:
-        return "_No stock price data available (free-tier API limit may apply)._"
+        return "_No stock price data yet — build the index on the **Index** tab._"
     parts = []
     for ticker, candles in raw_candles.items():
         closes = candles["c"]
-        highs  = candles["h"]
-        lows   = candles["l"]
+        highs = candles["h"]
+        lows = candles["l"]
         latest = closes[-1]
-        first  = closes[0]
-        pct    = ((latest - first) / first) * 100
-        arrow  = "▲" if pct >= 0 else "▼"
-        badge  = "🟢" if pct >= 0 else "🔴"
+        first = closes[0]
+        pct = ((latest - first) / first) * 100
+        arrow = "▲" if pct >= 0 else "▼"
+        badge = "🟢" if pct >= 0 else "🔴"
         parts.append(
             f"**{ticker}** {badge} &nbsp; "
             f"Close: **${latest:.2f}** &nbsp; {arrow} {pct:+.1f}% &nbsp;|&nbsp; "
@@ -149,31 +114,94 @@ def _build_news_df() -> pd.DataFrame:
     for doc in company_docs + market_docs:
         m = doc["metadata"]
         rows.append({
-            "Date":     _ts_to_date(m.get("published_at")),
-            "Ticker":   m.get("ticker") or "Market",
+            "Date": _ts_to_date(m.get("published_at")),
+            "Ticker": m.get("ticker") or "Market",
             "Headline": m.get("headline", ""),
-            "Source":   m.get("source", ""),
-            "Impact":   m.get("impact_level", ""),
-            "Tags":     ", ".join(m.get("topic_tags") or []),
+            "Source": m.get("source", ""),
+            "Impact": m.get("impact_level", ""),
+            "Tags": ", ".join(m.get("topic_tags") or []),
         })
     rows.sort(key=lambda x: x["Date"], reverse=True)
     cols = ["Date", "Ticker", "Headline", "Source", "Impact", "Tags"]
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
-price_df       = _build_price_df()
-stock_summary  = _build_stock_summary_md()
-news_df        = _build_news_df()
+def _format_index_stats(total: int = 0, company: int = 0, market: int = 0, stock: int = 0) -> str:
+    if total == 0:
+        return (
+            f"**Index empty** &nbsp;|&nbsp; backend: `{VECTOR_BACKEND}` &nbsp;|&nbsp; "
+            f"Tickers: {', '.join(TICKERS)} &nbsp;|&nbsp; "
+            "_Use the **Index** tab to fetch news and build the database._"
+        )
+    return (
+        f"**{total} docs indexed** &nbsp;|&nbsp; "
+        f"{company} company news &nbsp;|&nbsp; "
+        f"{market} market news &nbsp;|&nbsp; "
+        f"{stock} price summaries &nbsp;|&nbsp; "
+        f"backend: `{VECTOR_BACKEND}` &nbsp;|&nbsp; "
+        f"Tickers: {', '.join(TICKERS)}"
+    )
+
+
+def _apply_ingestion_result(result):
+    global company_docs, market_docs, stock_docs, raw_candles
+    company_docs = result.company_docs
+    market_docs = result.market_docs
+    stock_docs = result.stock_docs
+    raw_candles = result.raw_candles
+
+
+def build_local_index():
+    try:
+        result = run_ingestion(
+            embedder, vector_store, TICKERS, DAYS_BACK, VECTOR_BACKEND
+        )
+        _apply_ingestion_result(result)
+        price_df = _build_price_df()
+        news_df = _build_news_df()
+        return (
+            result.summary(),
+            _format_index_stats(
+                result.total_fetched,
+                result.company_count,
+                result.market_count,
+                result.stock_count,
+            ),
+            news_df,
+            _build_stock_summary_md(),
+            price_df,
+            f"Showing **{len(news_df)} articles** — last built from Finnhub.",
+        )
+    except Exception as exc:
+        msg = f"**Index build failed**\n\n`{exc}`"
+        return (
+            msg,
+            _format_index_stats(),
+            _build_news_df(),
+            _build_stock_summary_md(),
+            _build_price_df(),
+            "_News feed empty — build failed._",
+        )
+
+
+def upload_to_aws():
+    try:
+        return sync_to_aws(vector_store, AWS_POSTGRES_URL)
+    except Exception as exc:
+        return f"**AWS sync failed**\n\n`{exc}`"
+
 
 _EMPTY_SOURCES = pd.DataFrame(columns=["Headline", "Source", "Date", "Ticker", "Score"])
 
-INDEX_STATS = (
-    f"**{len(all_docs)} docs indexed** &nbsp;|&nbsp; "
-    f"{len(company_docs)} company news &nbsp;|&nbsp; "
-    f"{len(market_docs)} market news &nbsp;|&nbsp; "
-    f"{len(stock_docs)} price summaries &nbsp;|&nbsp; "
-    f"Tickers: {', '.join(TICKERS)}"
-)
+if INGEST_ON_STARTUP:
+    print("INGEST_ON_STARTUP=true — building index at startup...")
+    startup_result = run_ingestion(
+        embedder, vector_store, TICKERS, DAYS_BACK, VECTOR_BACKEND
+    )
+    _apply_ingestion_result(startup_result)
+    print(startup_result.summary().replace("**", "").replace("\n", " "))
+
+print("FinRAG system ready.")
 
 
 # ── Chat logic ────────────────────────────────────────────────────────────────
@@ -185,7 +213,7 @@ def respond(message: str, history: list, selected_ticker: str):
     if ticker is None:
         ticker = find_last_ticker(history)
 
-    docs = retriever.retrieve(question=message, ticker=ticker, top_k=5)
+    docs = retriever.retrieve(question=message, ticker=ticker, top_k=TOP_K)
     answer = generator.generate_answer(message, docs)
 
     ticker_note = (
@@ -195,7 +223,7 @@ def respond(message: str, history: list, selected_ticker: str):
     )
 
     updated_history = history + [
-        {"role": "user",      "content": message},
+        {"role": "user", "content": message},
         {"role": "assistant", "content": answer + ticker_note},
     ]
 
@@ -210,20 +238,46 @@ def respond(message: str, history: list, selected_ticker: str):
         for d in docs
     ]
     sources_df = pd.DataFrame(src_rows, columns=["Headline", "Source", "Date", "Ticker", "Score"])
-
     return "", updated_history, sources_df
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
+_initial_stats = _format_index_stats(
+    len(company_docs) + len(market_docs) + len(stock_docs),
+    len(company_docs),
+    len(market_docs),
+    len(stock_docs),
+)
+_initial_news = _build_news_df()
+_initial_stock_summary = _build_stock_summary_md()
+_initial_price_df = _build_price_df()
+
+def _postgres_host_hint(url: str | None) -> str:
+    if not url:
+        return "not configured"
+    if "@" in url:
+        return url.split("@")[-1].split("/")[0]
+    return url
+
+
+_db_hint = (
+    f"**Database target:** `{_postgres_host_hint(POSTGRES_URL)}` "
+    f"(via `POSTGRES_URL`)"
+)
+_sync_hint = (
+    f"Optional sync copy → `{_postgres_host_hint(AWS_POSTGRES_URL)}`"
+    if AWS_POSTGRES_URL and AWS_POSTGRES_URL != POSTGRES_URL
+    else "Optional **Sync to AWS** — set `AWS_POSTGRES_URL` if you use a separate local DB."
+)
+
 with gr.Blocks(title="FinRAG") as demo:
 
     gr.Markdown("# FinRAG: Financial Intelligence Assistant")
-    gr.Markdown(INDEX_STATS)
+    index_stats_md = gr.Markdown(_initial_stats)
 
     with gr.Tabs():
 
-        # ── Tab 1: Chat ───────────────────────────────────────────────────────
         with gr.TabItem("💬 Chat"):
             ticker_radio = gr.Radio(
                 choices=["Any"] + TICKERS,
@@ -252,10 +306,6 @@ with gr.Blocks(title="FinRAG") as demo:
 
                 with gr.Column(scale=2):
                     gr.Markdown("### Retrieved Sources")
-                    gr.Markdown(
-                        "_Documents used to generate the answer appear here after each query._",
-                        visible=True,
-                    )
                     sources_table = gr.Dataframe(
                         value=_EMPTY_SOURCES,
                         headers=["Headline", "Source", "Date", "Ticker", "Score"],
@@ -278,34 +328,26 @@ with gr.Blocks(title="FinRAG") as demo:
                 outputs=[chatbot, sources_table],
             )
 
-        # ── Tab 2: Stocks ─────────────────────────────────────────────────────
         with gr.TabItem("📈 Stocks"):
             gr.Markdown("### Price Summary (30-day window)")
-            gr.Markdown(stock_summary)
+            stock_summary_md = gr.Markdown(_initial_stock_summary)
             gr.Markdown("---")
             gr.Markdown("### Closing Price Chart")
+            price_plot = gr.LinePlot(
+                value=_initial_price_df,
+                x="Date",
+                y="Close",
+                color="Ticker",
+                title="Daily Closing Price",
+                tooltip=["Date", "Ticker", "Close"],
+                height=420,
+                x_label_angle=45,
+            )
 
-            if not price_df.empty:
-                gr.LinePlot(
-                    value=price_df,
-                    x="Date",
-                    y="Close",
-                    color="Ticker",
-                    title="Daily Closing Price",
-                    tooltip=["Date", "Ticker", "Close"],
-                    height=420,
-                    x_label_angle=45,
-                )
-            else:
-                gr.Markdown(
-                    "> **Price chart unavailable.** "
-                    "The Finnhub free tier does not include OHLCV candle data. "
-                    "Stock summaries in the vector index were loaded from text descriptions."
-                )
-
-        # ── Tab 3: News Feed ──────────────────────────────────────────────────
         with gr.TabItem("📰 News Feed"):
-            gr.Markdown(f"Showing **{len(news_df)} articles** fetched at startup.")
+            news_count_md = gr.Markdown(
+                f"Showing **{len(_initial_news)} articles** — build the index to refresh."
+            )
             with gr.Row():
                 tf = gr.Dropdown(
                     choices=["All"] + TICKERS,
@@ -321,13 +363,13 @@ with gr.Blocks(title="FinRAG") as demo:
                 )
 
             news_table = gr.Dataframe(
-                value=news_df,
+                value=_initial_news,
                 wrap=True,
                 max_height=560,
             )
 
             def _filter_news(ticker: str, impact: str) -> pd.DataFrame:
-                df = news_df.copy()
+                df = _build_news_df()
                 if ticker != "All":
                     df = df[df["Ticker"] == ticker]
                 if impact != "All":
@@ -337,8 +379,37 @@ with gr.Blocks(title="FinRAG") as demo:
             tf.change(_filter_news, inputs=[tf, imf], outputs=news_table)
             imf.change(_filter_news, inputs=[tf, imf], outputs=news_table)
 
+        with gr.TabItem("🗄️ Index"):
+            gr.Markdown(
+                "### Build the vector index\n\n"
+                f"**Build index** fetches Finnhub news, embeds, and saves to "
+                f"`{VECTOR_BACKEND}` at:\n\n"
+                f"{_db_hint}\n\n"
+                f"{_sync_hint}\n\n"
+                "For **AWS RDS**, set `POSTGRES_URL` to your RDS connection string "
+                "(with `?sslmode=require`). No Docker needed."
+            )
+            ingest_status = gr.Markdown(
+                "_Ready. Click **Build index** to fetch news and save to the database._"
+                if POSTGRES_URL
+                else "_Set `POSTGRES_URL` in `.env` (your RDS URL) before building the index._"
+            )
+            with gr.Row():
+                build_btn = gr.Button("Build index", variant="primary")
+                aws_btn = gr.Button("Sync to AWS", variant="secondary")
 
-# ── Launch ────────────────────────────────────────────────────────────────────
+            build_outputs = [
+                ingest_status,
+                index_stats_md,
+                news_table,
+                stock_summary_md,
+                price_plot,
+                news_count_md,
+            ]
+            build_btn.click(build_local_index, outputs=build_outputs)
+            aws_btn.click(upload_to_aws, outputs=ingest_status)
+
+
 if __name__ == "__main__":
     demo.launch(
         server_name="127.0.0.1",

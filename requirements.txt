@@ -11,6 +11,8 @@ torch
 
 # Vector database
 qdrant-client
+psycopg[binary]
+pgvector
 
 # LLM
 google-generativeai

@@ -25,14 +25,20 @@ from qdrant_client.models import (
     FieldCondition,
     MatchValue
 )
+from config.settings import COLLECTION_NAME, QDRANT_PATH, VECTOR_SIZE
 from .base import VectorStore
 
 
 class QdrantVectorStore(VectorStore):
-    def __init__(self, collection_name="finrag_news", vector_size=384):
-        self.collection_name = collection_name
-        self.client = QdrantClient(path="./qdrant_data")
-        self._ensure_collection(vector_size)
+    def __init__(
+        self,
+        collection_name: str | None = None,
+        vector_size: int | None = None,
+        qdrant_path: str | None = None,
+    ):
+        self.collection_name = collection_name or COLLECTION_NAME
+        self.client = QdrantClient(path=qdrant_path or QDRANT_PATH)
+        self._ensure_collection(vector_size or VECTOR_SIZE)
 
     def _ensure_collection(self, vector_size: int):
         existing = {c.name for c in self.client.get_collections().collections}
@@ -103,3 +109,26 @@ class QdrantVectorStore(VectorStore):
             limit=top_k
         )
         return results.points
+
+    def export_documents(self) -> list[dict]:
+        documents = []
+        next_offset = None
+        while True:
+            points, next_offset = self.client.scroll(
+                collection_name=self.collection_name,
+                limit=256,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+            for point in points:
+                payload = dict(point.payload)
+                text = payload.pop("text", "")
+                documents.append({
+                    "text": text,
+                    "metadata": payload,
+                    "embedding": point.vector,
+                })
+            if next_offset is None:
+                break
+        return documents
